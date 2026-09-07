@@ -203,7 +203,7 @@ def load_prompts(
             )
         ):
             raise ValueError(
-                "Prompt JSON must be an array of strings"
+                "Prompt JSON must contain an array of strings"
             )
 
         return data
@@ -215,67 +215,6 @@ def load_prompts(
         ).splitlines()
         if line.strip()
     ]
-
-
-# ---------------------------------------------------------------------
-# Prompt formatting
-# ---------------------------------------------------------------------
-
-def format_prompt(
-    tokenizer,
-    prompt: str,
-) -> str:
-
-    if getattr(
-        tokenizer,
-        "chat_template",
-        None,
-    ):
-        return tokenizer.apply_chat_template(
-            [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    return prompt
-
-
-def format_chat_messages(
-    tokenizer,
-    messages: list[dict[str, str]],
-) -> str:
-
-    if getattr(
-        tokenizer,
-        "chat_template",
-        None,
-    ):
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    lines = []
-
-    for message in messages:
-        role = message["role"].capitalize()
-        content = message["content"]
-
-        lines.append(
-            f"{role}: {content}"
-        )
-
-    lines.append(
-        "Assistant:"
-    )
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------
@@ -310,35 +249,68 @@ def unload_model(
     tokenizer,
     model,
 ) -> None:
+
     del model
     del tokenizer
+
     clear_memory()
 
 
 # ---------------------------------------------------------------------
-# Single generation
+# Generation helpers
 # ---------------------------------------------------------------------
 
-def generate_once(
+def get_pad_token_id(tokenizer) -> int | None:
+    if tokenizer.pad_token_id is not None:
+        return tokenizer.pad_token_id
+
+    return tokenizer.eos_token_id
+
+
+def generate_prompt_response(
     tokenizer,
     model,
-    prompt_text: str,
+    prompt: str,
     device: str,
     max_new_tokens: int,
 ) -> dict[str, Any]:
 
-    encoded = tokenizer(
-        prompt_text,
-        return_tensors="pt",
-    )
+    if getattr(
+        tokenizer,
+        "chat_template",
+        None,
+    ):
+        inputs = tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
 
-    encoded = {
-        key: value.to(device)
-        for key, value in encoded.items()
-    }
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
 
-    input_tokens = int(
-        encoded["input_ids"].shape[-1]
+    else:
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+        )
+
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
+
+    input_length = int(
+        inputs["input_ids"].shape[-1]
     )
 
     sync(device)
@@ -347,13 +319,13 @@ def generate_once(
 
     with torch.inference_mode():
         output = model.generate(
-            **encoded,
+            **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             use_cache=True,
-            pad_token_id=(
-                tokenizer.pad_token_id
-                or tokenizer.eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=get_pad_token_id(
+                tokenizer
             ),
         )
 
@@ -366,25 +338,162 @@ def generate_once(
 
     generated = output[
         0,
-        input_tokens:
+        input_length:
     ]
 
-    text = tokenizer.decode(
+    response = tokenizer.decode(
         generated,
         skip_special_tokens=True,
+    ).strip()
+
+    raw_response = tokenizer.decode(
+        generated,
+        skip_special_tokens=False,
     )
 
-    generated_tokens = int(
-        generated.shape[-1]
+    token_ids = (
+        generated
+        .detach()
+        .cpu()
+        .tolist()
     )
 
     return {
-        "response": text,
-        "input_tokens": input_tokens,
-        "generated_tokens": generated_tokens,
+        "response": response,
+        "raw_response": raw_response,
+        "generated_token_ids": token_ids,
+        "input_tokens": input_length,
+        "generated_tokens": len(token_ids),
         "generation_seconds": elapsed,
         "tokens_per_second": (
-            generated_tokens / elapsed
+            len(token_ids) / elapsed
+            if elapsed > 0
+            else 0.0
+        ),
+    }
+
+
+def generate_chat_response(
+    tokenizer,
+    model,
+    messages: list[dict[str, str]],
+    device: str,
+    max_new_tokens: int = 512,
+) -> dict[str, Any]:
+
+    if getattr(
+        tokenizer,
+        "chat_template",
+        None,
+    ):
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
+
+    else:
+        text_parts = []
+
+        for message in messages:
+            role = (
+                "User"
+                if message["role"] == "user"
+                else "Assistant"
+            )
+
+            text_parts.append(
+                f"{role}: {message['content']}"
+            )
+
+        text_parts.append(
+            "Assistant:"
+        )
+
+        text = "\n".join(
+            text_parts
+        )
+
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+        )
+
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
+
+    input_length = int(
+        inputs["input_ids"].shape[-1]
+    )
+
+    sync(device)
+
+    started = time.perf_counter()
+
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+
+            # Safety ceiling only.
+            # Normal chat models should stop naturally
+            # when they emit EOS/end-of-turn.
+            max_new_tokens=max_new_tokens,
+
+            do_sample=False,
+            use_cache=True,
+
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=get_pad_token_id(
+                tokenizer
+            ),
+        )
+
+    sync(device)
+
+    elapsed = (
+        time.perf_counter()
+        - started
+    )
+
+    generated = output[
+        0,
+        input_length:
+    ]
+
+    response = tokenizer.decode(
+        generated,
+        skip_special_tokens=True,
+    ).strip()
+
+    raw_response = tokenizer.decode(
+        generated,
+        skip_special_tokens=False,
+    )
+
+    token_ids = (
+        generated
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+    return {
+        "response": response,
+        "raw_response": raw_response,
+        "generated_token_ids": token_ids,
+        "generated_tokens": len(token_ids),
+        "generation_seconds": elapsed,
+        "tokens_per_second": (
+            len(token_ids) / elapsed
             if elapsed > 0
             else 0.0
         ),
@@ -392,7 +501,7 @@ def generate_once(
 
 
 # ---------------------------------------------------------------------
-# Automated evaluation
+# Automatic evaluation
 # ---------------------------------------------------------------------
 
 def evaluate(
@@ -407,43 +516,41 @@ def evaluate(
         device,
     )
 
-    rows = []
+    results = []
 
-    for prompt in tqdm(
-        prompts,
-        desc="Generating",
-        unit="prompt",
-        dynamic_ncols=True,
-    ):
-        formatted = format_prompt(
-            tokenizer,
-            prompt,
-        )
+    try:
+        for prompt in tqdm(
+            prompts,
+            desc="Generating",
+            unit="prompt",
+            dynamic_ncols=True,
+        ):
 
-        result = generate_once(
+            result = generate_prompt_response(
+                tokenizer,
+                model,
+                prompt,
+                device,
+                max_new_tokens,
+            )
+
+            results.append(
+                {
+                    "prompt": prompt,
+                    **result,
+                }
+            )
+
+    finally:
+        unload_model(
             tokenizer,
             model,
-            formatted,
-            device,
-            max_new_tokens,
         )
-
-        rows.append(
-            {
-                "prompt": prompt,
-                **result,
-            }
-        )
-
-    unload_model(
-        tokenizer,
-        model,
-    )
 
     return {
         "model": model_path,
         "device": device,
-        "results": rows,
+        "results": results,
     }
 
 
@@ -466,34 +573,51 @@ def print_comparison(
         ),
         start=1,
     ):
+
+        original_text = (
+            original_row["response"]
+            or (
+                "[NO VISIBLE OUTPUT]\n"
+                f"Raw: "
+                f"{original_row['raw_response']!r}"
+            )
+        )
+
+        transformed_text = (
+            transformed_row["response"]
+            or (
+                "[NO VISIBLE OUTPUT]\n"
+                f"Raw: "
+                f"{transformed_row['raw_response']!r}"
+            )
+        )
+
         console.print(
-            Panel.fit(
-                f"[bold]Prompt {i}[/bold]\n"
-                f"{original_row['prompt']}\n\n"
-                f"[cyan]Original[/cyan]\n"
-                f"{original_row['response']}\n\n"
-                f"[magenta]Transformed[/magenta]\n"
-                f"{transformed_row['response']}\n\n"
-                f"[dim]"
-                f"Original: "
-                f"{original_row['tokens_per_second']:.2f} tok/s\n"
-                f"Transformed: "
-                f"{transformed_row['tokens_per_second']:.2f} tok/s"
-                f"[/dim]"
+            Panel(
+                (
+                    f"[bold]Prompt[/bold]\n"
+                    f"{original_row['prompt']}\n\n"
+
+                    f"[cyan]Original[/cyan]\n"
+                    f"{original_text}\n\n"
+
+                    f"[magenta]Transformed[/magenta]\n"
+                    f"{transformed_text}"
+                ),
+                title=f"Prompt {i}",
             )
         )
 
 
 # ---------------------------------------------------------------------
-# Manual chat mode
+# Normal single-model chat
 # ---------------------------------------------------------------------
 
 def chat_with_single_model(
     model_path: str,
     label: str,
     device: str,
-    max_new_tokens: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
 
     tokenizer, model = load_model(
         model_path,
@@ -504,19 +628,25 @@ def chat_with_single_model(
         dict[str, str]
     ] = []
 
+    transcript: list[
+        dict[str, Any]
+    ] = []
+
     console.print(
         Panel.fit(
-            f"[bold]{label} Chat[/bold]\n\n"
+            f"[bold]{label}[/bold]\n\n"
+            "Chat normally.\n\n"
             "Commands:\n"
-            "  /exit   Leave chat\n"
-            "  /clear  Clear conversation history\n"
-            "  /history Show conversation history",
+            "  /clear   Clear conversation\n"
+            "  /history Show conversation\n"
+            "  /exit    Exit chat",
             border_style="cyan",
         )
     )
 
     try:
         while True:
+
             user_text = Prompt.ask(
                 "\n[bold green]You[/bold green]"
             )
@@ -537,9 +667,9 @@ def chat_with_single_model(
                 messages.clear()
 
                 console.print(
-                    "[yellow]"
-                    "Conversation history cleared."
-                    "[/yellow]"
+                    "[dim]"
+                    "Conversation cleared."
+                    "[/dim]"
                 )
 
                 continue
@@ -551,15 +681,25 @@ def chat_with_single_model(
                         "No conversation history."
                         "[/dim]"
                     )
-                else:
-                    for message in messages:
-                        role = (
-                            message["role"]
-                            .capitalize()
+
+                    continue
+
+                console.print()
+
+                for message in messages:
+                    if message["role"] == "user":
+                        console.print(
+                            f"[bold green]"
+                            f"You:"
+                            f"[/bold green] "
+                            f"{message['content']}"
                         )
 
+                    else:
                         console.print(
-                            f"[bold]{role}:[/bold] "
+                            f"[bold magenta]"
+                            f"{label}:"
+                            f"[/bold magenta] "
                             f"{message['content']}"
                         )
 
@@ -572,47 +712,76 @@ def chat_with_single_model(
                 }
             )
 
-            formatted = (
-                format_chat_messages(
-                    tokenizer,
-                    messages,
+            result = (
+                generate_chat_response(
+                    tokenizer=tokenizer,
+                    model=model,
+                    messages=messages,
+                    device=device,
                 )
             )
 
-            result = generate_once(
-                tokenizer,
-                model,
-                formatted,
-                device,
-                max_new_tokens,
-            )
-
-            assistant_text = (
+            response = (
                 result["response"]
                 .strip()
             )
 
+            if not response:
+                console.print(
+                    Panel(
+                        (
+                            "[yellow]"
+                            "The model produced no visible response."
+                            "[/yellow]\n\n"
+                            f"Raw output: "
+                            f"{result['raw_response']!r}\n"
+                            f"Token IDs: "
+                            f"{result['generated_token_ids']}"
+                        ),
+                        title=label,
+                        border_style="yellow",
+                    )
+                )
+
+                # Remove the unanswered user message so that
+                # repeated failed turns don't accumulate.
+                messages.pop()
+
+                continue
+
             messages.append(
                 {
                     "role": "assistant",
-                    "content": assistant_text,
+                    "content": response,
+                }
+            )
+
+            transcript.append(
+                {
+                    "user": user_text,
+                    "assistant": response,
+                    "generated_tokens": (
+                        result["generated_tokens"]
+                    ),
+                    "generation_seconds": (
+                        result[
+                            "generation_seconds"
+                        ]
+                    ),
+                    "tokens_per_second": (
+                        result[
+                            "tokens_per_second"
+                        ]
+                    ),
                 }
             )
 
             console.print(
                 Panel(
-                    assistant_text,
+                    response,
                     title=label,
                     border_style="magenta",
                 )
-            )
-
-            console.print(
-                "[dim]"
-                f"{result['generated_tokens']} tokens | "
-                f"{result['generation_seconds']:.2f}s | "
-                f"{result['tokens_per_second']:.2f} tok/s"
-                "[/dim]"
             )
 
     finally:
@@ -621,33 +790,40 @@ def chat_with_single_model(
             model,
         )
 
-    return messages
+    return transcript
 
+
+# ---------------------------------------------------------------------
+# Side-by-side normal chat
+# ---------------------------------------------------------------------
 
 def side_by_side_chat(
     original_path: str,
     transformed_path: str,
     device: str,
-    max_new_tokens: int,
 ) -> list[dict[str, Any]]:
 
     console.print(
         Panel.fit(
             "[bold]Side-by-Side Chat[/bold]\n\n"
-            "Each prompt is sent to both models.\n\n"
+            "Every message is sent to both models.\n"
+            "Both models maintain their own conversation history.\n\n"
             "Commands:\n"
-            "  /exit   Leave chat\n"
-            "  /clear  Clear conversation history",
+            "  /clear   Clear both conversations\n"
+            "  /exit    Exit chat",
             border_style="cyan",
         )
     )
 
-    original_tokenizer, original_model = (
-        load_model(
-            original_path,
-            device,
-        )
+    console.print(
+        "[yellow]"
+        "This mode loads both models at once "
+        "and therefore uses more RAM/VRAM."
+        "[/yellow]"
     )
+
+    original_tokenizer = None
+    original_model = None
 
     transformed_tokenizer = None
     transformed_model = None
@@ -665,21 +841,24 @@ def side_by_side_chat(
     ] = []
 
     try:
-        console.print(
-            "\n[yellow]"
-            "Loading both models simultaneously may require "
-            "substantially more RAM/VRAM."
-            "[/yellow]"
+        (
+            original_tokenizer,
+            original_model,
+        ) = load_model(
+            original_path,
+            device,
         )
 
-        transformed_tokenizer, transformed_model = (
-            load_model(
-                transformed_path,
-                device,
-            )
+        (
+            transformed_tokenizer,
+            transformed_model,
+        ) = load_model(
+            transformed_path,
+            device,
         )
 
         while True:
+
             user_text = Prompt.ask(
                 "\n[bold green]You[/bold green]"
             )
@@ -701,9 +880,9 @@ def side_by_side_chat(
                 transformed_messages.clear()
 
                 console.print(
-                    "[yellow]"
-                    "Conversation history cleared."
-                    "[/yellow]"
+                    "[dim]"
+                    "Conversation histories cleared."
+                    "[/dim]"
                 )
 
                 continue
@@ -722,129 +901,161 @@ def side_by_side_chat(
                 }
             )
 
-            original_prompt = (
-                format_chat_messages(
-                    original_tokenizer,
-                    original_messages,
+            original_result = (
+                generate_chat_response(
+                    tokenizer=original_tokenizer,
+                    model=original_model,
+                    messages=original_messages,
+                    device=device,
                 )
             )
 
-            transformed_prompt = (
-                format_chat_messages(
-                    transformed_tokenizer,
-                    transformed_messages,
+            transformed_result = (
+                generate_chat_response(
+                    tokenizer=transformed_tokenizer,
+                    model=transformed_model,
+                    messages=transformed_messages,
+                    device=device,
                 )
             )
 
-            original_result = generate_once(
-                original_tokenizer,
-                original_model,
-                original_prompt,
-                device,
-                max_new_tokens,
+            original_response = (
+                original_result[
+                    "response"
+                ].strip()
             )
 
-            transformed_result = generate_once(
-                transformed_tokenizer,
-                transformed_model,
-                transformed_prompt,
-                device,
-                max_new_tokens,
+            transformed_response = (
+                transformed_result[
+                    "response"
+                ].strip()
             )
 
-            original_text = (
-                original_result["response"]
-                .strip()
-            )
+            if original_response:
+                original_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            original_response
+                        ),
+                    }
+                )
 
-            transformed_text = (
-                transformed_result["response"]
-                .strip()
-            )
+            else:
+                original_messages.pop()
 
-            original_messages.append(
-                {
-                    "role": "assistant",
-                    "content": original_text,
-                }
-            )
+            if transformed_response:
+                transformed_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            transformed_response
+                        ),
+                    }
+                )
 
-            transformed_messages.append(
-                {
-                    "role": "assistant",
-                    "content": transformed_text,
-                }
-            )
+            else:
+                transformed_messages.pop()
 
             transcript.append(
                 {
                     "user": user_text,
-                    "original": original_result,
-                    "transformed": transformed_result,
+                    "original": (
+                        original_result
+                    ),
+                    "transformed": (
+                        transformed_result
+                    ),
                 }
             )
 
-            console.print(
-                Panel(
-                    original_text,
-                    title="Original",
-                    border_style="cyan",
+            if original_response:
+                console.print(
+                    Panel(
+                        original_response,
+                        title="Original Model",
+                        border_style="cyan",
+                    )
                 )
-            )
 
-            console.print(
-                "[dim]"
-                f"{original_result['generated_tokens']} tokens | "
-                f"{original_result['generation_seconds']:.2f}s | "
-                f"{original_result['tokens_per_second']:.2f} tok/s"
-                "[/dim]"
-            )
-
-            console.print(
-                Panel(
-                    transformed_text,
-                    title="Transformed",
-                    border_style="magenta",
+            else:
+                console.print(
+                    Panel(
+                        (
+                            "[yellow]"
+                            "No visible response.\n\n"
+                            f"Raw: "
+                            f"{original_result['raw_response']!r}"
+                        ),
+                        title="Original Model",
+                        border_style="yellow",
+                    )
                 )
-            )
 
-            console.print(
-                "[dim]"
-                f"{transformed_result['generated_tokens']} tokens | "
-                f"{transformed_result['generation_seconds']:.2f}s | "
-                f"{transformed_result['tokens_per_second']:.2f} tok/s"
-                "[/dim]"
-            )
+            if transformed_response:
+                console.print(
+                    Panel(
+                        transformed_response,
+                        title=(
+                            "Transformed Model"
+                        ),
+                        border_style="magenta",
+                    )
+                )
+
+            else:
+                console.print(
+                    Panel(
+                        (
+                            "[yellow]"
+                            "No visible response.\n\n"
+                            f"Raw: "
+                            f"{transformed_result['raw_response']!r}"
+                        ),
+                        title=(
+                            "Transformed Model"
+                        ),
+                        border_style="yellow",
+                    )
+                )
 
     finally:
+
         if transformed_model is not None:
             unload_model(
                 transformed_tokenizer,
                 transformed_model,
             )
 
-        unload_model(
-            original_tokenizer,
-            original_model,
-        )
+        if original_model is not None:
+            unload_model(
+                original_tokenizer,
+                original_model,
+            )
 
     return transcript
 
+
+# ---------------------------------------------------------------------
+# Memory-friendly one-prompt comparison
+# ---------------------------------------------------------------------
 
 def sequential_comparison_chat(
     original_path: str,
     transformed_path: str,
     device: str,
-    max_new_tokens: int,
 ) -> list[dict[str, Any]]:
 
     console.print(
         Panel.fit(
-            "[bold]Memory-Friendly Manual Comparison[/bold]\n\n"
-            "For each prompt, the original model is tested first,\n"
-            "then unloaded before the transformed model is tested.\n\n"
-            "Conversation history is not maintained between turns.\n"
-            "This mode uses much less memory.",
+            "[bold]"
+            "Memory-Friendly Manual Comparison"
+            "[/bold]\n\n"
+            "Enter a prompt and WeightLab runs it "
+            "against each model sequentially.\n\n"
+            "This mode does not preserve multi-turn history.\n\n"
+            "Command:\n"
+            "  /exit    Exit",
             border_style="cyan",
         )
     )
@@ -852,92 +1063,124 @@ def sequential_comparison_chat(
     transcript = []
 
     while True:
+
         user_text = Prompt.ask(
-            "\n[bold green]Prompt[/bold green]"
+            "\n[bold green]You[/bold green]"
         )
 
-        command = (
+        if (
             user_text
             .strip()
             .lower()
-        )
-
-        if command in {
-            "/exit",
-            "/quit",
-        }:
+            in {
+                "/exit",
+                "/quit",
+            }
+        ):
             break
 
-        original_tokenizer, original_model = (
-            load_model(
-                original_path,
-                device,
-            )
-        )
+        # ---------------------------------------------------------
+        # Original
+        # ---------------------------------------------------------
 
-        original_prompt = format_prompt(
-            original_tokenizer,
-            user_text,
-        )
-
-        original_result = generate_once(
+        (
             original_tokenizer,
             original_model,
-            original_prompt,
+        ) = load_model(
+            original_path,
             device,
-            max_new_tokens,
         )
 
-        unload_model(
-            original_tokenizer,
-            original_model,
-        )
-
-        transformed_tokenizer, transformed_model = (
-            load_model(
-                transformed_path,
-                device,
+        try:
+            original_result = (
+                generate_prompt_response(
+                    tokenizer=(
+                        original_tokenizer
+                    ),
+                    model=original_model,
+                    prompt=user_text,
+                    device=device,
+                    max_new_tokens=512,
+                )
             )
-        )
 
-        transformed_prompt = format_prompt(
-            transformed_tokenizer,
-            user_text,
-        )
+        finally:
+            unload_model(
+                original_tokenizer,
+                original_model,
+            )
 
-        transformed_result = generate_once(
+        # ---------------------------------------------------------
+        # Transformed
+        # ---------------------------------------------------------
+
+        (
             transformed_tokenizer,
             transformed_model,
-            transformed_prompt,
+        ) = load_model(
+            transformed_path,
             device,
-            max_new_tokens,
         )
 
-        unload_model(
-            transformed_tokenizer,
-            transformed_model,
-        )
+        try:
+            transformed_result = (
+                generate_prompt_response(
+                    tokenizer=(
+                        transformed_tokenizer
+                    ),
+                    model=(
+                        transformed_model
+                    ),
+                    prompt=user_text,
+                    device=device,
+                    max_new_tokens=512,
+                )
+            )
+
+        finally:
+            unload_model(
+                transformed_tokenizer,
+                transformed_model,
+            )
 
         transcript.append(
             {
                 "user": user_text,
                 "original": original_result,
-                "transformed": transformed_result,
+                "transformed": (
+                    transformed_result
+                ),
             }
         )
 
         console.print(
             Panel(
-                original_result["response"],
-                title="Original",
+                (
+                    original_result[
+                        "response"
+                    ]
+                    or (
+                        "[NO VISIBLE RESPONSE]\n"
+                        f"{original_result['raw_response']!r}"
+                    )
+                ),
+                title="Original Model",
                 border_style="cyan",
             )
         )
 
         console.print(
             Panel(
-                transformed_result["response"],
-                title="Transformed",
+                (
+                    transformed_result[
+                        "response"
+                    ]
+                    or (
+                        "[NO VISIBLE RESPONSE]\n"
+                        f"{transformed_result['raw_response']!r}"
+                    )
+                ),
+                title="Transformed Model",
                 border_style="magenta",
             )
         )
@@ -950,6 +1193,7 @@ def sequential_comparison_chat(
 # ---------------------------------------------------------------------
 
 def choose_test_mode() -> str:
+
     table = Table(
         title="Choose Evaluation Mode",
         show_lines=True,
@@ -973,31 +1217,46 @@ def choose_test_mode() -> str:
     table.add_row(
         "1",
         "Automatic comparison",
-        "Run the same fixed prompt suite against original and transformed models.",
+        (
+            "Run a fixed prompt suite against "
+            "the original and transformed models."
+        ),
     )
 
     table.add_row(
         "2",
         "Chat with transformed model",
-        "Interactive multi-turn conversation with the transformed checkpoint.",
+        (
+            "Normal multi-turn chat using "
+            "the transformed checkpoint."
+        ),
     )
 
     table.add_row(
         "3",
         "Chat with original model",
-        "Interactive multi-turn conversation with the exact original model revision.",
+        (
+            "Normal multi-turn chat using "
+            "the exact original model."
+        ),
     )
 
     table.add_row(
         "4",
         "Side-by-side chat",
-        "Send every message to both models and compare responses live. Uses more RAM/VRAM.",
+        (
+            "Chat with both models at the same time "
+            "and compare their replies."
+        ),
     )
 
     table.add_row(
         "5",
-        "Memory-friendly manual comparison",
-        "Send one prompt to each model sequentially. Lower memory use, but no multi-turn history.",
+        "Memory-friendly comparison",
+        (
+            "Enter one prompt at a time. "
+            "Models are loaded sequentially."
+        ),
     )
 
     table.add_row(
@@ -1006,13 +1265,11 @@ def choose_test_mode() -> str:
         "Leave the tester.",
     )
 
-    console.print(
-        table
-    )
+    console.print(table)
 
     choice = IntPrompt.ask(
         "Selection",
-        default=1,
+        default=2,
     )
 
     mapping = {
@@ -1033,31 +1290,44 @@ def choose_test_mode() -> str:
 
 
 # ---------------------------------------------------------------------
-# Interactive app
+# Experiment loading
 # ---------------------------------------------------------------------
 
-def interactive() -> None:
-    console.print(
-        Panel.fit(
-            "[bold cyan]"
-            "WeightLab Model Tester"
-            "[/bold cyan]\n"
-            "Evaluate and manually chat with "
-            "original vs transformed models",
-            border_style="cyan",
-        )
+def load_experiment(
+    experiment: Path,
+) -> tuple[
+    dict[str, Any],
+    str,
+    Path,
+]:
+
+    manifest_path = (
+        experiment
+        / "manifest.json"
     )
 
-    experiment = choose_experiment()
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"manifest.json not found: "
+            f"{manifest_path}"
+        )
 
     manifest = json.loads(
-        (
-            experiment
-            / "manifest.json"
-        ).read_text(
+        manifest_path.read_text(
             encoding="utf-8"
         )
     )
+
+    transformed_path = (
+        experiment
+        / "model"
+    )
+
+    if not transformed_path.exists():
+        raise FileNotFoundError(
+            f"Transformed model directory "
+            f"not found: {transformed_path}"
+        )
 
     repo_id = (
         manifest["model"]
@@ -1069,13 +1339,66 @@ def interactive() -> None:
         ["resolved_revision"]
     )
 
-    transformed_path = (
+    console.print(
+        f"\nResolving original model "
+        f"[cyan]{repo_id}[/cyan]..."
+    )
+
+    original_path = snapshot_download(
+        repo_id=repo_id,
+        revision=resolved_revision,
+    )
+
+    return (
+        manifest,
+        original_path,
+        transformed_path,
+    )
+
+
+# ---------------------------------------------------------------------
+# Main interactive app
+# ---------------------------------------------------------------------
+
+def interactive(
+    selected_experiment: Path | None = None,
+) -> None:
+
+    console.print(
+        Panel.fit(
+            "[bold cyan]"
+            "WeightLab Model Tester"
+            "[/bold cyan]\n"
+            "Automatic evaluation and normal interactive chat",
+            border_style="cyan",
+        )
+    )
+
+    experiment = (
+        selected_experiment
+        if selected_experiment is not None
+        else choose_experiment()
+    )
+
+    experiment = (
         experiment
-        / "model"
+        .expanduser()
+        .resolve()
+    )
+
+    (
+        manifest,
+        original_path,
+        transformed_path,
+    ) = load_experiment(
+        experiment
     )
 
     console.print(
-        f"\nModel: [cyan]{repo_id}[/cyan]"
+        f"\nModel: "
+        f"[cyan]"
+        f"{manifest['model']['repo_id']}"
+        f"[/cyan]"
     )
 
     console.print(
@@ -1083,6 +1406,13 @@ def interactive() -> None:
         f"[magenta]"
         f"{manifest.get('experiment_name', experiment.name)}"
         f"[/magenta]"
+    )
+
+    console.print(
+        f"Revision: "
+        f"[dim]"
+        f"{manifest['model']['resolved_revision']}"
+        f"[/dim]"
     )
 
     device = Prompt.ask(
@@ -1100,25 +1430,26 @@ def interactive() -> None:
         device
     )
 
-    max_new_tokens = IntPrompt.ask(
-        "Max new tokens",
-        default=128,
-    )
-
-    original_path = snapshot_download(
-        repo_id=repo_id,
-        revision=resolved_revision,
+    console.print(
+        f"Using device: "
+        f"[cyan]{device}[/cyan]"
     )
 
     while True:
+
         mode = choose_test_mode()
 
         if mode == "exit":
             break
 
+        # ---------------------------------------------------------
+        # Automatic evaluation
+        # ---------------------------------------------------------
+
         if mode == "automatic":
+
             prompt_file_text = Prompt.ask(
-                "Prompt file path "
+                "Prompt file "
                 "(blank = built-ins)",
                 default="",
             )
@@ -1135,6 +1466,13 @@ def interactive() -> None:
                 prompt_file
             )
 
+            max_new_tokens = (
+                IntPrompt.ask(
+                    "Maximum generation tokens",
+                    default=128,
+                )
+            )
+
             original = evaluate(
                 original_path,
                 prompts,
@@ -1143,7 +1481,9 @@ def interactive() -> None:
             )
 
             transformed = evaluate(
-                str(transformed_path),
+                str(
+                    transformed_path
+                ),
                 prompts,
                 device,
                 max_new_tokens,
@@ -1159,13 +1499,11 @@ def interactive() -> None:
                     experiment
                 ),
                 "manifest": manifest,
-                "settings": {
-                    "device": device,
-                    "max_new_tokens": (
-                        max_new_tokens
-                    ),
-                    "mode": "automatic",
-                },
+                "mode": "automatic",
+                "device": device,
+                "max_new_tokens": (
+                    max_new_tokens
+                ),
                 "original": original,
                 "transformed": transformed,
             }
@@ -1190,14 +1528,20 @@ def interactive() -> None:
                 f"[/green] {output}"
             )
 
+        # ---------------------------------------------------------
+        # Transformed chat
+        # ---------------------------------------------------------
+
         elif mode == "transformed_chat":
-            history = chat_with_single_model(
-                str(
-                    transformed_path
-                ),
-                "Transformed Model",
-                device,
-                max_new_tokens,
+
+            transcript = (
+                chat_with_single_model(
+                    str(
+                        transformed_path
+                    ),
+                    "Transformed Model",
+                    device,
+                )
             )
 
             output = (
@@ -1207,7 +1551,7 @@ def interactive() -> None:
 
             output.write_text(
                 json.dumps(
-                    history,
+                    transcript,
                     indent=2,
                     ensure_ascii=False,
                 ),
@@ -1215,17 +1559,23 @@ def interactive() -> None:
             )
 
             console.print(
-                f"[green]"
+                f"\n[green]"
                 f"Saved chat:"
                 f"[/green] {output}"
             )
 
+        # ---------------------------------------------------------
+        # Original chat
+        # ---------------------------------------------------------
+
         elif mode == "original_chat":
-            history = chat_with_single_model(
-                original_path,
-                "Original Model",
-                device,
-                max_new_tokens,
+
+            transcript = (
+                chat_with_single_model(
+                    original_path,
+                    "Original Model",
+                    device,
+                )
             )
 
             output = (
@@ -1235,7 +1585,7 @@ def interactive() -> None:
 
             output.write_text(
                 json.dumps(
-                    history,
+                    transcript,
                     indent=2,
                     ensure_ascii=False,
                 ),
@@ -1243,19 +1593,25 @@ def interactive() -> None:
             )
 
             console.print(
-                f"[green]"
+                f"\n[green]"
                 f"Saved chat:"
                 f"[/green] {output}"
             )
 
+        # ---------------------------------------------------------
+        # Side-by-side
+        # ---------------------------------------------------------
+
         elif mode == "side_by_side":
-            transcript = side_by_side_chat(
-                original_path,
-                str(
-                    transformed_path
-                ),
-                device,
-                max_new_tokens,
+
+            transcript = (
+                side_by_side_chat(
+                    original_path,
+                    str(
+                        transformed_path
+                    ),
+                    device,
+                )
             )
 
             output = (
@@ -1273,12 +1629,17 @@ def interactive() -> None:
             )
 
             console.print(
-                f"[green]"
+                f"\n[green]"
                 f"Saved comparison:"
                 f"[/green] {output}"
             )
 
+        # ---------------------------------------------------------
+        # Sequential comparison
+        # ---------------------------------------------------------
+
         elif mode == "sequential":
+
             transcript = (
                 sequential_comparison_chat(
                     original_path,
@@ -1286,7 +1647,6 @@ def interactive() -> None:
                         transformed_path
                     ),
                     device,
-                    max_new_tokens,
                 )
             )
 
@@ -1305,7 +1665,7 @@ def interactive() -> None:
             )
 
             console.print(
-                f"[green]"
+                f"\n[green]"
                 f"Saved comparison:"
                 f"[/green] {output}"
             )
@@ -1322,9 +1682,10 @@ def interactive() -> None:
 # ---------------------------------------------------------------------
 
 def main() -> int:
+
     parser = argparse.ArgumentParser(
         description=(
-            "WeightLab model evaluation "
+            "WeightLab model evaluator "
             "and interactive chat tester"
         )
     )
@@ -1333,27 +1694,27 @@ def main() -> int:
         "--experiment",
         type=Path,
         help=(
-            "Optional experiment path. "
-            "Without this, interactive mode is used."
+            "Optional WeightLab experiment directory. "
+            "If omitted, choose interactively."
         ),
     )
 
     args = parser.parse_args()
 
     try:
-        if args.experiment:
-            console.print(
-                "[yellow]"
-                "Direct --experiment mode currently "
-                "starts the interactive evaluation menu."
-                "[/yellow]"
-            )
 
-        interactive()
+        interactive(
+            selected_experiment=(
+                args.experiment
+                if args.experiment
+                else None
+            )
+        )
 
         return 0
 
     except KeyboardInterrupt:
+
         console.print(
             "\n[yellow]"
             "Cancelled."
@@ -1363,6 +1724,7 @@ def main() -> int:
         return 130
 
     except Exception:
+
         console.print_exception()
 
         return 1
