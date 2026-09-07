@@ -6,3 +6,4 @@ tqdm
 PyYAML
 huggingface_hub
 rich
+prompt_toolkit
