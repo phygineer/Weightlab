@@ -1,0 +1,8 @@
+torch
+safetensors
+transformers
+accelerate
+tqdm
+PyYAML
+huggingface_hub
+rich
