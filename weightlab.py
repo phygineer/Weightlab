@@ -392,106 +392,444 @@ def print_pipeline(pipeline: list[PipelineStep]) -> None:
 
 def choose_operation() -> PipelineStep | None:
     options = [
-        ("identity", "Identity"),
-        ("multiply", "Multiply"),
-        ("add", "Add"),
-        ("subtract", "Subtract"),
-        ("divide", "Divide"),
-        ("l2_normalize", "L2 normalize"),
-        ("rms_normalize", "RMS normalize"),
-        ("standardize", "Standardize"),
-        ("mean_center", "Mean center"),
-        ("minmax_normalize", "Min-Max normalize"),
-        ("maxabs_normalize", "Max-Abs normalize"),
-        ("clip", "Clip"),
-        ("round", "Round"),
-        ("sign", "Sign only"),
-        ("abs", "Absolute value"),
-        ("negate", "Negate"),
-        ("sin", "Sine"),
-        ("cos", "Cosine"),
-        ("tanh", "Tanh"),
-        ("softsign", "Softsign"),
-        ("signed_power", "Signed power"),
-        ("gaussian_noise", "Gaussian noise"),
-        ("relative_gaussian_noise", "Relative Gaussian noise"),
-        ("uniform_noise", "Uniform noise"),
-        ("random_sign_flip", "Random sign flip"),
-        ("magnitude_prune", "Magnitude prune"),
-        ("keep_top_percent", "Keep top magnitude %"),
-        ("random_prune", "Random prune"),
-        ("shuffle_weights", "Shuffle weights"),
-        ("shuffle_magnitudes", "Shuffle magnitudes"),
-        ("shuffle_signs", "Shuffle signs"),
-        ("interpolate", "Interpolate"),
-        ("quantize", "Simulated symmetric quantization"),
+        (
+            "identity",
+            "Identity",
+            "Returns the tensor unchanged.",
+            "Use as a control experiment to verify that checkpoint read/write itself does not change behavior.",
+        ),
+        (
+            "multiply",
+            "Multiply",
+            "Multiplies every selected weight by a constant.",
+            "Useful for scale-sensitivity experiments or testing whether absolute weight magnitude matters.",
+        ),
+        (
+            "add",
+            "Add",
+            "Adds a constant value to every selected weight.",
+            "Useful for studying sensitivity to uniform bias shifts across a tensor.",
+        ),
+        (
+            "subtract",
+            "Subtract",
+            "Subtracts a constant value from every selected weight.",
+            "Same family as Add, but shifts the entire tensor in the negative direction.",
+        ),
+        (
+            "divide",
+            "Divide",
+            "Divides every selected weight by a constant.",
+            "Useful for reducing tensor scale and testing how strongly activations depend on learned magnitude.",
+        ),
+        (
+            "l2_normalize",
+            "L2 normalize",
+            "Scales the tensor so its total Euclidean/L2 norm becomes approximately 1.",
+            "Used to remove overall magnitude while preserving the relative direction of values within the tensor.",
+        ),
+        (
+            "rms_normalize",
+            "RMS normalize",
+            "Divides the tensor by its root-mean-square magnitude.",
+            "Useful for comparing tensors on a common RMS scale while preserving their mean.",
+        ),
+        (
+            "standardize",
+            "Standardize",
+            "Transforms the tensor to approximately zero mean and unit standard deviation.",
+            "Common statistical preprocessing; useful for testing whether learned mean and variance are important.",
+        ),
+        (
+            "mean_center",
+            "Mean center",
+            "Subtracts the tensor mean so the resulting mean is approximately zero.",
+            "Useful for isolating the effect of a tensor's learned offset while leaving its spread mostly intact.",
+        ),
+        (
+            "minmax_normalize",
+            "Min-Max normalize",
+            "Maps the tensor's minimum and maximum into a chosen output range.",
+            "Common data preprocessing technique; useful for forcing weights into a fixed bounded interval.",
+        ),
+        (
+            "maxabs_normalize",
+            "Max-Abs normalize",
+            "Divides all values by the largest absolute value in the tensor.",
+            "Useful when you want all weights constrained approximately to [-1, 1] without shifting zero.",
+        ),
+        (
+            "clip",
+            "Clip",
+            "Limits weights to a specified minimum and maximum.",
+            "Useful for studying the importance of extreme/outlier weights and for winsorization-like experiments.",
+        ),
+        (
+            "round",
+            "Round",
+            "Rounds weights to a chosen number of decimal places.",
+            "Useful for precision-loss experiments and approximating coarse numerical representations.",
+        ),
+        (
+            "sign",
+            "Sign only",
+            "Replaces each value with -1, 0, or +1 based only on its sign.",
+            "Useful for testing how much information is carried by sign versus magnitude.",
+        ),
+        (
+            "abs",
+            "Absolute value",
+            "Removes all negative signs and keeps only weight magnitudes.",
+            "Useful for studying whether learned positive/negative direction is essential.",
+        ),
+        (
+            "negate",
+            "Negate",
+            "Flips the sign of every selected weight.",
+            "A simple symmetry experiment for testing how dependent a component is on learned sign direction.",
+        ),
+        (
+            "sin",
+            "Sine",
+            "Applies sin(multiplier × weight) element-wise.",
+            "Useful as a nonlinear bounded transformation that preserves some local ordering near zero.",
+        ),
+        (
+            "cos",
+            "Cosine",
+            "Applies cos(multiplier × weight) element-wise.",
+            "Useful for intentionally remapping the distribution through a periodic nonlinear function.",
+        ),
+        (
+            "tanh",
+            "Tanh",
+            "Applies tanh(multiplier × weight), compressing large magnitudes into approximately [-1, 1].",
+            "Useful for soft clipping and studying the importance of very large parameter magnitudes.",
+        ),
+        (
+            "softsign",
+            "Softsign",
+            "Applies x / (1 + |x|), smoothly compressing large values.",
+            "Similar to tanh but with a different saturation curve; useful for soft magnitude compression.",
+        ),
+        (
+            "signed_power",
+            "Signed power",
+            "Applies sign(x) × |x|^p so sign is preserved while magnitude is reshaped.",
+            "Useful for exaggerating or suppressing large weights without losing their sign.",
+        ),
+        (
+            "gaussian_noise",
+            "Gaussian noise",
+            "Adds normally distributed random noise with configurable mean and standard deviation.",
+            "Classic robustness test for measuring how tolerant the model is to random parameter perturbations.",
+        ),
+        (
+            "relative_gaussian_noise",
+            "Relative Gaussian noise",
+            "Adds noise proportional to each weight's own magnitude.",
+            "Useful when perturbation strength should scale with the learned parameter instead of using one absolute noise level.",
+        ),
+        (
+            "uniform_noise",
+            "Uniform noise",
+            "Adds random noise sampled uniformly between a chosen low and high value.",
+            "Useful for bounded perturbation experiments where every disturbance lies within a known interval.",
+        ),
+        (
+            "random_sign_flip",
+            "Random sign flip",
+            "Randomly flips the sign of a chosen percentage of weights.",
+            "Useful for measuring how sensitive learned behavior is to sign corruption.",
+        ),
+        (
+            "magnitude_prune",
+            "Magnitude prune",
+            "Sets weights below a chosen absolute magnitude threshold to zero.",
+            "Standard pruning-style experiment for testing whether small weights are dispensable.",
+        ),
+        (
+            "keep_top_percent",
+            "Keep top magnitude %",
+            "Keeps only the largest weights by absolute magnitude and zeros the rest.",
+            "Useful for sparsity and compression experiments such as retaining only the strongest 90%, 50%, or 10% of weights.",
+        ),
+        (
+            "random_prune",
+            "Random prune",
+            "Randomly sets a chosen percentage of weights to zero.",
+            "Useful as a control against magnitude pruning to compare structured importance versus random removal.",
+        ),
+        (
+            "shuffle_weights",
+            "Shuffle weights",
+            "Randomly permutes all values inside the tensor.",
+            "Preserves the exact value distribution but destroys where each learned value is located. Very useful for testing whether arrangement matters.",
+        ),
+        (
+            "shuffle_magnitudes",
+            "Shuffle magnitudes",
+            "Keeps each position's sign but randomly redistributes weight magnitudes.",
+            "Useful for separating the importance of sign patterns from the importance of magnitude placement.",
+        ),
+        (
+            "shuffle_signs",
+            "Shuffle signs",
+            "Keeps magnitudes at their original positions but randomly redistributes signs.",
+            "Useful for separating magnitude information from the learned spatial sign pattern.",
+        ),
+        (
+            "interpolate",
+            "Interpolate",
+            "Moves weights gradually between the original tensor and another target representation.",
+            "Excellent for degradation sweeps because alpha lets you smoothly move from the original model toward zero, sign-only, or normalized weights.",
+        ),
+        (
+            "quantize",
+            "Simulated symmetric quantization",
+            "Rounds weights onto a limited signed integer grid, then dequantizes them back to the original floating dtype.",
+            "Useful for studying INT8/INT4-style precision loss without creating a deployment-specific quantized checkpoint.",
+        ),
     ]
 
-    table = Table(title="Choose Operation")
-    table.add_column("#", justify="right")
-    table.add_column("Operation")
-    for i, (_, label) in enumerate(options, 1):
-        table.add_row(str(i), label)
-    table.add_row("0", "Cancel")
+    table = Table(
+        title="Choose Operation",
+        show_lines=True,
+    )
+
+    table.add_column(
+        "#",
+        justify="right",
+        style="cyan",
+        no_wrap=True,
+    )
+
+    table.add_column(
+        "Operation",
+        style="bold",
+        no_wrap=True,
+    )
+
+    table.add_column(
+        "What it does",
+        style="white",
+    )
+
+    table.add_column(
+        "Typical use",
+        style="dim",
+    )
+
+    for i, (_, label, description, usage) in enumerate(
+        options,
+        start=1,
+    ):
+        table.add_row(
+            str(i),
+            label,
+            description,
+            usage,
+        )
+
+    table.add_row(
+        "0",
+        "Cancel",
+        "Return to the pipeline editor.",
+        "",
+    )
+
     console.print(table)
 
-    idx = IntPrompt.ask("Selection", default=0)
+    idx = IntPrompt.ask(
+        "Selection",
+        default=0,
+    )
+
     if idx == 0:
         return None
+
     if not 1 <= idx <= len(options):
-        console.print("[red]Invalid selection[/red]")
+        console.print(
+            "[red]Invalid selection[/red]"
+        )
         return None
 
     name = options[idx - 1][0]
     p: dict[str, Any] = {}
 
-    if name in {"multiply", "add", "subtract", "divide"}:
-        special = Prompt.ask("Value (number, pi, e)", default="pi" if name == "multiply" else "1")
+    if name in {
+        "multiply",
+        "add",
+        "subtract",
+        "divide",
+    }:
+        special = Prompt.ask(
+            "Value (number, pi, e)",
+            default=(
+                "pi"
+                if name == "multiply"
+                else "1"
+            ),
+        )
+
         if special.lower() == "pi":
             p["value"] = math.pi
+
         elif special.lower() == "e":
             p["value"] = math.e
+
         else:
             p["value"] = float(special)
-    elif name == "minmax_normalize":
-        p["min_value"] = FloatPrompt.ask("Target min", default=0.0)
-        p["max_value"] = FloatPrompt.ask("Target max", default=1.0)
-    elif name == "clip":
-        p["min"] = FloatPrompt.ask("Min", default=-0.1)
-        p["max"] = FloatPrompt.ask("Max", default=0.1)
-    elif name == "round":
-        p["decimals"] = IntPrompt.ask("Decimals", default=3)
-    elif name in {"sin", "cos", "tanh"}:
-        p["multiplier"] = FloatPrompt.ask("Multiplier", default=1.0)
-    elif name == "signed_power":
-        p["exponent"] = FloatPrompt.ask("Exponent", default=2.0)
-    elif name == "gaussian_noise":
-        p["mean"] = FloatPrompt.ask("Mean", default=0.0)
-        p["std"] = FloatPrompt.ask("Std", default=0.001)
-        p["seed"] = IntPrompt.ask("Seed", default=42)
-    elif name == "relative_gaussian_noise":
-        p["std"] = FloatPrompt.ask("Relative std", default=0.001)
-        p["seed"] = IntPrompt.ask("Seed", default=42)
-    elif name == "uniform_noise":
-        p["low"] = FloatPrompt.ask("Low", default=-0.001)
-        p["high"] = FloatPrompt.ask("High", default=0.001)
-        p["seed"] = IntPrompt.ask("Seed", default=42)
-    elif name in {"random_sign_flip", "random_prune"}:
-        p["probability"] = FloatPrompt.ask("Probability [0..1]", default=0.01)
-        p["seed"] = IntPrompt.ask("Seed", default=42)
-    elif name == "magnitude_prune":
-        p["threshold"] = FloatPrompt.ask("Magnitude threshold", default=0.001)
-    elif name == "keep_top_percent":
-        p["percent"] = FloatPrompt.ask("Percent to retain", default=90.0)
-    elif name in {"shuffle_weights", "shuffle_magnitudes", "shuffle_signs"}:
-        p["seed"] = IntPrompt.ask("Seed", default=42)
-    elif name == "interpolate":
-        p["alpha"] = FloatPrompt.ask("Alpha [0..1]", default=0.5)
-        p["target"] = Prompt.ask("Target", choices=["zero", "sign", "l2_normalized"], default="zero")
-    elif name == "quantize":
-        p["bits"] = IntPrompt.ask("Bits", default=8)
 
-    return PipelineStep(name, p)
+    elif name == "minmax_normalize":
+        p["min_value"] = FloatPrompt.ask(
+            "Target min",
+            default=0.0,
+        )
+
+        p["max_value"] = FloatPrompt.ask(
+            "Target max",
+            default=1.0,
+        )
+
+    elif name == "clip":
+        p["min"] = FloatPrompt.ask(
+            "Min",
+            default=-0.1,
+        )
+
+        p["max"] = FloatPrompt.ask(
+            "Max",
+            default=0.1,
+        )
+
+    elif name == "round":
+        p["decimals"] = IntPrompt.ask(
+            "Decimals",
+            default=3,
+        )
+
+    elif name in {
+        "sin",
+        "cos",
+        "tanh",
+    }:
+        p["multiplier"] = FloatPrompt.ask(
+            "Multiplier",
+            default=1.0,
+        )
+
+    elif name == "signed_power":
+        p["exponent"] = FloatPrompt.ask(
+            "Exponent",
+            default=2.0,
+        )
+
+    elif name == "gaussian_noise":
+        p["mean"] = FloatPrompt.ask(
+            "Mean",
+            default=0.0,
+        )
+
+        p["std"] = FloatPrompt.ask(
+            "Std",
+            default=0.001,
+        )
+
+        p["seed"] = IntPrompt.ask(
+            "Seed",
+            default=42,
+        )
+
+    elif name == "relative_gaussian_noise":
+        p["std"] = FloatPrompt.ask(
+            "Relative std",
+            default=0.001,
+        )
+
+        p["seed"] = IntPrompt.ask(
+            "Seed",
+            default=42,
+        )
+
+    elif name == "uniform_noise":
+        p["low"] = FloatPrompt.ask(
+            "Low",
+            default=-0.001,
+        )
+
+        p["high"] = FloatPrompt.ask(
+            "High",
+            default=0.001,
+        )
+
+        p["seed"] = IntPrompt.ask(
+            "Seed",
+            default=42,
+        )
+
+    elif name in {
+        "random_sign_flip",
+        "random_prune",
+    }:
+        p["probability"] = FloatPrompt.ask(
+            "Probability [0..1]",
+            default=0.01,
+        )
+
+        p["seed"] = IntPrompt.ask(
+            "Seed",
+            default=42,
+        )
+
+    elif name == "magnitude_prune":
+        p["threshold"] = FloatPrompt.ask(
+            "Magnitude threshold",
+            default=0.001,
+        )
+
+    elif name == "keep_top_percent":
+        p["percent"] = FloatPrompt.ask(
+            "Percent to retain",
+            default=90.0,
+        )
+
+    elif name in {
+        "shuffle_weights",
+        "shuffle_magnitudes",
+        "shuffle_signs",
+    }:
+        p["seed"] = IntPrompt.ask(
+            "Seed",
+            default=42,
+        )
+
+    elif name == "interpolate":
+        p["alpha"] = FloatPrompt.ask(
+            "Alpha [0..1]",
+            default=0.5,
+        )
+
+        p["target"] = Prompt.ask(
+            "Target",
+            choices=[
+                "zero",
+                "sign",
+                "l2_normalized",
+            ],
+            default="zero",
+        )
+
+    elif name == "quantize":
+        p["bits"] = IntPrompt.ask(
+            "Bits",
+            default=8,
+        )
+
+    return PipelineStep(
+        name,
+        p,
+    )
 
 def build_pipeline_interactively() -> list[PipelineStep]:
     pipeline: list[PipelineStep] = []
